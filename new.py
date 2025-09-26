@@ -363,32 +363,25 @@ def main():
             _, T = get_time_remaining()
             current_week = math.ceil(T * 240 / 5)  # Convert time to week number
             
-            # Check for week change and clear positions
-            if current_week != VolTrader.last_week:
-                print(f"\nNew week {current_week} starting...")
-                clear_all_positions()
-                VolTrader.last_week = current_week
-                VolTrader.positions_cleared = True
+            # # Check for week change and clear positions
+            # if current_week != VolTrader.last_week:
+            #     clear_all_positions()
+            #     VolTrader.last_week = current_week
+            #     VolTrader.positions_cleared = True
             
             # Trading logic - execute every TRADE_INTERVAL seconds
             if current_time - last_trade_time >= TRADE_INTERVAL:
-                # Get forecast volatility from news
+
                 forecast_vol = get_vol()
-                print(f"\nForecast volatility: {forecast_vol:.2%}")
-                
-                # Get current implied volatilities of all options
                 option_vols = get_all_implied_vols()
                 if not option_vols:
-                    print("Could not calculate implied volatilities")
+
                     continue
                 
                 # Find options with highest and lowest IV
                 lowest_vol_option = min(option_vols.items(), key=lambda x: x[1])
                 highest_vol_option = max(option_vols.items(), key=lambda x: x[1])
-                
-                print(f"Lowest IV option: {lowest_vol_option[0]} at {lowest_vol_option[1]:.2%}")
-                print(f"Highest IV option: {highest_vol_option[0]} at {highest_vol_option[1]:.2%}")
-                
+            
                 # Trading decision
                 if forecast_vol > BSParameters.sigma:
                     # Volatility expected to increase - buy lowest IV option
