@@ -1,0 +1,418 @@
+from typing import Dict, List, Optional, Tuple, Callable
+import os, sys, time, requests, signal
+import math
+from typing import NamedTuple
+import requests
+from scipy.stats import norm
+import re
+
+# 1. get IV from the book options
+# 2. compare to BS.sigma (benchmark)
+# 3. if good enough, trade it (long vega/short vega based on vol discre)
+# 4. delta hedge
+# 4. ensure delta is within range
+
+API_KEY = os.getenv("RIT_API_KEY", "API")  # Replace with your actual API key
+BASE_URL = "http://localhost:9999/v1"
+s = requests.Session()
+s.headers.update({"X-API-key": API_KEY})
+
+#Current Stock price
+def get_last(ticker: str) -> float:
+    resp = s.get('http://localhost:9999/v1/securities', params={'ticker': ticker})
+    if resp.ok:
+        securities = resp.json()
+        if securities and len(securities) > 0:
+            return float(securities[0]['last'])
+    return 0.0
+# last_price = get_last(SECURITIES.CALLS.RTM48C)
+
+
+#Time remaining in RIT
+def get_time_remaining() -> Tuple[float, float]:
+#check with case
+    resp = s.get('http://localhost:9999/v1/case')
+    if resp.ok:
+        case = resp.json()
+        # Get seconds remaining out of 300 total seconds
+        tick = float(case.get('tick', 0))
+        total_seconds = 300.0
+        seconds_remaining = total_seconds - tick
+        days_remaining = math.ceil(seconds_remaining / 15)
+        years_remaining = days_remaining / 240
+        return days_remaining, years_remaining
+    return 0.0, 0.0
+
+def get_news():
+    resp = s.get('http://localhost:9999/v1/news')
+    if resp.ok:
+        news = resp.json()
+        news_id = news[0]['news_id']
+        headline = news[0]['headline']
+        body = news[0]['body']
+        return news_id, headline, body
+
+
+#get news function that will update vol based on news
+def get_vol():
+    news = get_news()
+    # news_id = news[0]
+    headline, body = news
+    # if news_id == 0: # no news, use initial value
+    #     return 20.0
+    # else:
+        # Case 1: Initial volatility announcement (Week 1)
+    if "Risk free rate" in headline:
+        # Extract number before % after "volatility is"
+        match = re.search(r'volatility is (\d+)%', body)
+        if match:
+            return float(match.group(1)) / 100.0
+            
+    # Case 2: News with range (News 1, 2, 3)
+    if headline.startswith("News"):
+        # Extract two numbers before % after "between"
+        match = re.search(r'between (\d+)% and (\d+)%', body)
+        if match:
+            lower = float(match.group(1)) / 100.0
+            upper = float(match.group(2)) / 100.0
+            return (lower + upper) / 2.0
+            
+    # Case 3: Announcements (Announcement 1, 2, 3)
+    if "Announcement" in headline:
+        # Extract number before % after "will be"
+        match = re.search(r'will be (\d+)%', body)
+        if match:
+            return float(match.group(1)) / 100.0
+    return 0.20  # 20% as default volatility
+    
+      #  extract vol
+
+
+class SECURITIES:
+    ETF = "RTM"
+    
+    class CALLS:
+        RTM48C = "RTM48C"
+        RTM49C = "RTM49C"
+        RTM50C = "RTM50C"
+        RTM51C = "RTM51C"
+        RTM52C = "RTM52C"
+        
+    class PUTS:
+        RTM48P = "RTM48P"
+        RTM49P = "RTM49P"
+        RTM50P = "RTM50P"
+        RTM51P = "RTM51P"
+        RTM52P = "RTM52P"
+    
+    # Dictionary for strike prices
+    STRIKES = {
+        CALLS.RTM48C: 48, PUTS.RTM48P: 48,
+        CALLS.RTM49C: 49, PUTS.RTM49P: 49,
+        CALLS.RTM50C: 50, PUTS.RTM50P: 50,
+        CALLS.RTM51C: 51, PUTS.RTM51P: 51,
+        CALLS.RTM52C: 52, PUTS.RTM52P: 52
+    }
+
+
+class PositionLimits:
+    ETF_MAX_ABS = 50000
+    OPT_GROSS_LIMIT = 2500
+    OPT_NET_LIMIT = 1000
+
+    #can you double check
+
+class BSParameters:
+    S: float = get_last("RTM")  # Underlying price
+    r: float = 0  # Risk-free rate
+    q: float = 0.0   # Dividend yield
+    T: float = get_time_remaining()[1]   # Time to expiry (years)
+    sigma: float = get_vol()  # Volatility
+
+
+class PositionTracker:
+    def __init__(self, client):
+        self.client = client
+        self.positions = {}
+        self.update_positions()
+
+    
+    def get_position(self, ticker: str) -> int:
+        return self.positions.get(ticker, 0)
+    
+    def get_total_positions(self) -> Tuple[int, int]: 
+        #this is only Options total position!
+        gross = 0
+        net = 0
+        for ticker, pos in self.positions.items():
+            if ticker != SECURITIES.ETF:  
+                gross += abs(pos)
+                net += pos
+        return gross, net
+    
+    #condition met 
+    def check_limits(self, new_orders: Dict[str, int]) -> bool:
+        test_positions = self.positions.copy()
+        
+        # Add new orders
+        for ticker, qty in new_orders.items():
+            test_positions[ticker] = test_positions.get(ticker, 0) + qty
+        
+        # Check ETF limit
+        if abs(test_positions.get(SECURITIES.ETF, 0)) > PositionLimits.ETF_MAX_ABS:
+            return False
+            
+        # Calculate new option totals
+        gross = 0
+        net = 0
+        for ticker, pos in test_positions.items():
+            if ticker != SECURITIES.ETF:
+                gross += abs(pos)
+                net += pos
+                
+        # Check option limits
+        if gross > PositionLimits.OPT_GROSS_LIMIT:
+            return False
+        if abs(net) > PositionLimits.OPT_NET_LIMIT:
+            return False
+            
+        return True
+
+####################################
+def bs_price(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    
+    if is_call:
+        price = S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
+    else:
+        price = K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+    return price
+
+
+def vega(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    d1 = (math.log(S/K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    return S * norm.pdf(d1) * math.sqrt(T)
+
+
+def implied_volatility(option_price, S, K, T, r, option_type='call', tol=1e-6, max_iter=100):
+    sigma = BSParameters.sigma # initial guess is benchmark vol
+    
+    for i in range(max_iter):
+        price = bs_price(S, K, T, r, sigma, option_type)
+        v = vega(S, K, T, r, sigma)
+        
+        price_diff = price - option_price
+        
+        if abs(price_diff) < tol:
+            return sigma
+        
+        sigma -= price_diff / v  # Newton-Raphson update
+    
+    return None  # if it doesn't converge
+
+
+def delta(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
+    d1 = (math.log(S/K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    if is_call:
+        return norm.cdf(d1)
+    else:
+        return norm.cdf(d1) - 1
+
+def gamma(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    d1 = (math.log(S/K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    return norm.pdf(d1) / (S * sigma * math.sqrt(T))
+
+def hedge():
+    # Constants
+    CONTRACT_SIZE = 100
+    DELTA_LIMIT = 7000
+    #GAMMA_THRESHOLD = 0.01
+    REBALANCE_THRESHOLD = 1000  # Rebalance when delta exposure changes by this amount
+
+    # Get current market data
+    S = get_last(SECURITIES.ETF)
+    _, T = get_time_remaining()
+    r = 0.0
+
+    total_delta = 0.0
+    total_gamma = 0.0
+    atm_strike = min(SECURITIES.STRIKES.values(), key=lambda x: abs(x - S))
+
+    # Calculate current exposures
+    for option_ticker, K in SECURITIES.STRIKES.items():
+        market_price = get_last(option_ticker)
+        is_call = option_ticker in vars(SECURITIES.CALLS)
+        implied_vol = implied_volatility(market_price, S, K, T, r, 'call' if is_call else 'put')
+        
+        if implied_vol is not None:
+            position_size = PositionTracker.get_position(option_ticker)
+            # Account for contract size in calculations
+            contract_position = position_size * CONTRACT_SIZE
+            
+            # Calculate exposures
+            delta_value = delta(S, K, T, r, implied_vol, is_call)
+            gamma_value = gamma(S, K, T, r, implied_vol)
+            
+            # Accumulate total exposures
+            total_delta += delta_value * contract_position
+            total_gamma += gamma_value * contract_position
+
+    current_etf_position = PositionTracker.get_position(SECURITIES.ETF)
+    total_delta += current_etf_position  # Add current ETF position's delta (delta = 1)
+
+    # # First handle gamma hedging if necessary
+    # if abs(total_gamma) > GAMMA_THRESHOLD:
+    #     # Find ATM options for gamma hedging
+    #     atm_call = f"RTM{atm_strike}C"
+    #     atm_put = f"RTM{atm_strike}P"
+        
+    #     # Calculate required gamma hedge position
+    #     gamma_hedge_size = int(-total_gamma / (gamma(S, atm_strike, T, r, BSParameters.sigma) * CONTRACT_SIZE))
+        
+    #     # Submit gamma hedge orders (using ATM straddle to minimize delta impact)
+    #     if abs(gamma_hedge_size) > 0:
+    #         new_orders = {
+    #             atm_call: gamma_hedge_size,
+    #             atm_put: gamma_hedge_size
+    #         }
+    #         if PositionTracker.check_limits(new_orders):
+    #             for ticker, qty in new_orders.items():
+    #                 resp = s.post('http://localhost:9999/v1/orders', params={
+    #                     'ticker': ticker,
+    #                     'type': 'MARKET',
+    #                     'quantity': abs(qty),
+    #                     'action': 'BUY' if qty > 0 else 'SELL'
+    #                 })
+    #                 if resp.ok:
+    #                     print(f"Gamma hedge submitted: {qty} contracts of {ticker}")
+
+    # Then handle delta hedging
+    required_etf_hedge = -total_delta  # Negative of total delta exposure
+    current_hedge_difference = required_etf_hedge - current_etf_position
+
+    # Only rebalance if the hedge difference is significant
+    if abs(current_hedge_difference) > REBALANCE_THRESHOLD:
+        # Ensure we stay within delta limits
+        hedge_quantity = max(min(current_hedge_difference, DELTA_LIMIT), -DELTA_LIMIT)
+        
+        new_orders = {SECURITIES.ETF: int(hedge_quantity)}
+        if PositionTracker.check_limits(new_orders):
+            resp = s.post('http://localhost:9999/v1/orders', params={
+                'ticker': SECURITIES.ETF,
+                'type': 'MARKET',
+                'quantity': abs(int(hedge_quantity)),
+                'action': 'BUY' if hedge_quantity > 0 else 'SELL'
+            })
+            # if resp.ok:
+            #     print(f"Delta hedge submitted: {int(hedge_quantity)} shares of {SECURITIES.ETF}")
+            #     print(f"Total delta exposure after hedge: {total_delta - hedge_quantity:.2f}")
+            #     print(f"Total gamma exposure: {total_gamma:.4f}")
+            # else:
+            #     print("Failed to submit delta hedge order")
+        else:
+            print("Delta hedge order exceeds position limits")
+
+
+
+class VolTrader:
+    last_week = 1
+    positions_cleared = False
+
+def get_all_implied_vols() -> Dict[str, float]:
+    """Get implied volatilities for all options"""
+    S = get_last(SECURITIES.ETF)
+    _, T = get_time_remaining()
+    r = 0.0
+    
+    option_vols = {}
+    for ticker, strike in SECURITIES.STRIKES.items():
+        price = get_last(ticker)
+        is_call = ticker in vars(SECURITIES.CALLS)
+        vol = implied_volatility(price, S, strike, T, r, 'call' if is_call else 'put')
+        if vol is not None:
+            option_vols[ticker] = vol
+    return option_vols
+
+def clear_all_positions():
+    """Clear all positions at week end"""
+    for ticker in [SECURITIES.ETF] + list(SECURITIES.STRIKES.keys()):
+        pos = PositionTracker.get_position(ticker)
+        if pos != 0:
+            resp = s.post('http://localhost:9999/v1/orders', params={
+                'ticker': ticker,
+                'type': 'MARKET',
+                'quantity': abs(pos),
+                'action': 'SELL' if pos > 0 else 'BUY'
+            })
+            # if resp.ok:
+            #     print(f"Cleared position: {pos} of {ticker}")
+
+def main():
+    """Main trading loop implementing volatility arbitrage strategy"""
+    last_trade_time = 0
+    TRADE_INTERVAL = 5  # Seconds between trade attempts
+    
+    while True:
+        try:
+            current_time = time.time()
+            _, T = get_time_remaining()
+            current_week = math.ceil(T * 240 / 5)  # Convert time to week number
+            
+            # # Check for week change and clear positions
+            # if current_week != VolTrader.last_week:
+            #     clear_all_positions()
+            #     VolTrader.last_week = current_week
+            #     VolTrader.positions_cleared = True
+            
+            # Trading logic - execute every TRADE_INTERVAL seconds
+            if current_time - last_trade_time >= TRADE_INTERVAL:
+
+                forecast_vol = get_vol()
+                option_vols = get_all_implied_vols()
+                if not option_vols:
+
+                    continue
+                
+                # Find options with highest and lowest IV
+                lowest_vol_option = min(option_vols.items(), key=lambda x: x[1])
+                highest_vol_option = max(option_vols.items(), key=lambda x: x[1])
+            
+                # Trading decision
+                if forecast_vol > BSParameters.sigma:
+                    # Volatility expected to increase - buy lowest IV option
+                    target_option = lowest_vol_option[0]
+                    trade_qty = PositionLimits.OPT_NET_LIMIT
+                    action = 'BUY'
+                else:
+                    # Volatility expected to decrease - sell highest IV option
+                    target_option = highest_vol_option[0]
+                    trade_qty = -PositionLimits.OPT_NET_LIMIT
+                    action = 'SELL'
+                
+                # Execute option trade
+                new_orders = {target_option: trade_qty}
+                if PositionTracker.check_limits(new_orders):
+                    resp = s.post('http://localhost:9999/v1/orders', params={
+                        'ticker': target_option,
+                        'type': 'MARKET',
+                        'quantity': abs(trade_qty),
+                        'action': action
+                    })
+                    if resp.ok:
+                        print(f"Executed {action} {abs(trade_qty)} contracts of {target_option}")
+                        
+                        # Delta hedge the position
+                        hedge()
+                
+                last_trade_time = current_time
+                
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+        
+        time.sleep(0.1)
+
+if __name__ == '__main__':
+  main()
+
+
