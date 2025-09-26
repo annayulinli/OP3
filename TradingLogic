@@ -1,0 +1,38 @@
+OP3 - Strategy Volatility Arbitrage
+
+Monitor volatility forecasts from news announcements
+Compare forecast volatility against current option implied volatilities
+Trade options based on volatility divergence
+Maintain delta-neutral portfolio through continuous hedging
+
+Trading Rules:
+
+When forecast volatility > current volatility (BSParameters.sigma):
+Buy the option with lowest implied volatility
+Take maximum allowed position (1000 contracts)
+Expectation: IV will increase to match forecast
+
+When forecast volatility < current volatility:
+Sell the option with highest implied volatility
+Take maximum short position (-1000 contracts)
+Expectation: IV will decrease to match forecast
+
+Risk Management:
+Delta hedge all option positions using ETF
+Maintain total delta exposure within ±7000 limit
+Rebalance delta hedge when exposure changes by 1000
+Clear all positions at week boundaries (need to figure out how to track week) ticks 
+
+Position limits:
+ETF: ±50,000 shares
+Options gross: 2,500 contracts
+Options net: ±1,000 contracts
+
+Implementation:
+Trade every 5 seconds
+Calculate implied volatilities for all options - excel
+Monitor news for volatility forecasts - extract #
+Track and adjust positions based on tick/week changes
+Use market orders for immediate execution
+
+Market-making strategy that profits from the convergence of implied volatilities toward the forecast volatility while maintaining delta neutrality.
