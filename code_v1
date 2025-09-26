@@ -57,7 +57,7 @@ def get_news():
 def get_vol():
     news = get_news()
     # news_id = news[0]
-    headline, body = news
+    news_id, headline, body = news
     # if news_id == 0: # no news, use initial value
     #     return 20.0
     # else:
@@ -409,8 +409,8 @@ def main():
                 
         except Exception as e:
             print(f"Error in main loop: {e}")
-        
-        time.sleep(0.1)
+  #Error in main loop: PositionTracker.check_limits() missing 1 required positional argument: 'new_orders'      
+        time.sleep(0.5)
 
 if __name__ == '__main__':
   main()
